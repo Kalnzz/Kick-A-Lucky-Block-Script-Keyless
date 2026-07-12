@@ -1,0 +1,643 @@
+-- FaLtix HuBx
+-- Detect Sleeping NPC | Auto Treat
+
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+
+-- Services
+local Players     = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+
+-- Konfigurasi
+local SLEEP_DISTANCE = 5
+local STEP_DELAY     = 0.8
+local LIME_GREEN     = Color3.fromRGB(0, 255, 0)
+local COLOR_TOLERANCE = 50
+
+local ITEM_SET = {
+    ["Bandages"]    = true,
+    ["Ointment"]    = true,
+    ["Medkit"]      = true,
+    ["Thermo"]      = true,
+    ["Eye Drops"]   = true,
+    ["IV Drops"]    = true,
+    ["Cough Syrup"] = true,
+    ["Maple Syrup"] = true,
+    ["Herbs"]       = true,
+    ["Medicine"]    = true,
+}
+
+-- Data global
+local DetectedNPC = {}
+
+-- Helper: ambil folder nested
+local function getFolder(root, ...)
+    local cur = root
+    for _, name in ipairs({...}) do
+        if not cur then return nil end
+        cur = cur:FindFirstChild(name)
+    end
+    return cur
+end
+
+-- Helper: ambil CFrame dari object apapun
+local function getCFrame(obj)
+    if not obj then return nil end
+
+    if obj:IsA("BasePart") then
+        return obj.CFrame
+    end
+
+    if obj:IsA("Model") and obj.PrimaryPart then
+        return obj.PrimaryPart.CFrame
+    end
+
+    local part = obj:FindFirstChildWhichIsA("BasePart", true)
+    if part then
+        return part.CFrame
+    end
+
+    return nil
+end
+
+-- Helper: teleport ke CFrame + anti ragdoll
+local function teleportTo(cf)
+    if not cf then
+        warn("[FaLtix] teleportTo: CFrame nil")
+        return false
+    end
+
+    local char = LocalPlayer.Character
+    if not char then
+        warn("[FaLtix] Character tidak ada")
+        return false
+    end
+
+    local myHRP = char:FindFirstChild("HumanoidRootPart")
+    local myHum = char:FindFirstChild("Humanoid")
+
+    if not myHRP then
+        warn("[FaLtix] HumanoidRootPart tidak ada")
+        return false
+    end
+
+    if myHum then
+        myHum:ChangeState(Enum.HumanoidStateType.GettingUp)
+    end
+
+    myHRP.CFrame = cf + Vector3.new(0, 3, 0)
+
+    for _ = 1, 5 do
+        local c = LocalPlayer.Character
+        local h = c and c:FindFirstChild("Humanoid")
+        if h then
+            h:ChangeState(Enum.HumanoidStateType.GettingUp)
+        end
+        task.wait(0.1)
+    end
+
+    return true
+end
+
+-- Helper: fire ProximityPrompt bernama PP
+local function firePP(obj, label)
+    if not obj then
+        warn("[FaLtix] firePP: obj nil - " .. (label or "unknown"))
+        return
+    end
+    pcall(function()
+        local pp = obj:FindFirstChild("PP", true)
+        if pp and pp:IsA("ProximityPrompt") then
+            fireproximityprompt(pp)
+            warn("[FaLtix] Fire PP - " .. (label or tostring(obj)))
+        else
+            warn("[FaLtix] PP tidak ada di: " .. (label or tostring(obj)))
+            Rayfield:Notify({
+                Title   = "PP Tidak Ada",
+                Content = "PP tidak ditemukan di " .. (label or tostring(obj)),
+                Duration = 3,
+                Image   = 4483362458,
+            })
+        end
+    end)
+end
+
+-- Helper: fire ProximityPrompt bernama PP2
+local function firePP2(obj, label)
+    if not obj then
+        warn("[FaLtix] firePP2: obj nil - " .. (label or "unknown"))
+        return
+    end
+    pcall(function()
+        local pp2 = obj:FindFirstChild("PP2", true)
+        if pp2 and pp2:IsA("ProximityPrompt") then
+            fireproximityprompt(pp2)
+            warn("[FaLtix] Fire PP2 - " .. (label or tostring(obj)))
+        else
+            warn("[FaLtix] PP2 tidak ada di: " .. (label or tostring(obj)))
+            Rayfield:Notify({
+                Title   = "PP2 Tidak Ada",
+                Content = "PP2 tidak ditemukan di " .. (label or tostring(obj)),
+                Duration = 3,
+                Image   = 4483362458,
+            })
+        end
+    end)
+end
+
+-- Helper: scan semua Model di workspace cari folder Items
+local function findItemsFolder()
+    -- Scan level 1
+    for _, obj in ipairs(workspace:GetChildren()) do
+        if obj.Name == "Model" then
+            local items = obj:FindFirstChild("Items")
+            if items then
+                warn("[FaLtix] Items ketemu: " .. items:GetFullName())
+                return items
+            end
+        end
+    end
+
+    -- Deep scan
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj.Name == "Items" and obj.Parent and obj.Parent.Name == "Model" then
+            warn("[FaLtix] Items ketemu (deep): " .. obj:GetFullName())
+            return obj
+        end
+    end
+
+    warn("[FaLtix] Items folder tidak ketemu sama sekali!")
+    Rayfield:Notify({
+        Title   = "Items Tidak Ditemukan",
+        Content = "Folder Items tidak ada di dalam Model manapun",
+        Duration = 5,
+        Image   = 4483362458,
+    })
+    return nil
+end
+
+-- Helper: cek warna apakah Lime Green
+local function isLimeGreen(color)
+    local r = math.abs(color.R * 255 - LIME_GREEN.R * 255)
+    local g = math.abs(color.G * 255 - LIME_GREEN.G * 255)
+    local b = math.abs(color.B * 255 - LIME_GREEN.B * 255)
+    return r <= COLOR_TOLERANCE and g <= COLOR_TOLERANCE and b <= COLOR_TOLERANCE
+end
+
+-- Helper: cek progress Analyzer dari warna button 1-4
+local function getAnalyzerProgress(analyzer)
+    local buttons = analyzer:FindFirstChild("Buttons")
+    if not buttons then
+        warn("[FaLtix] Folder Buttons tidak ada di Analyzer")
+        Rayfield:Notify({
+            Title   = "Buttons Tidak Ada",
+            Content = "Folder Buttons tidak ditemukan di Analyzer",
+            Duration = 3,
+            Image   = 4483362458,
+        })
+        return 0, 0
+    end
+
+    local greenCount = 0
+    for i = 1, 4 do
+        local btn = buttons:FindFirstChild(tostring(i))
+        if btn then
+            local part = btn:IsA("BasePart") and btn or btn:FindFirstChildWhichIsA("BasePart", true)
+            if part and isLimeGreen(part.Color) then
+                greenCount = greenCount + 1
+            end
+        end
+    end
+
+    return math.floor((greenCount / 4) * 100), greenCount
+end
+
+-- Helper: loop scan Analyzer sampai 100%, tidak ada timeout
+local function waitAnalyzer100(analyzer, roomName)
+    while true do
+        local progress, greenCount = getAnalyzerProgress(analyzer)
+
+        warn("[FaLtix] Analyzer " .. roomName .. ": " .. progress .. "% (" .. greenCount .. "/4)")
+
+        Rayfield:Notify({
+            Title   = "Analyzer " .. roomName,
+            Content = "Progress: " .. progress .. "% (" .. greenCount .. " dari 4)",
+            Duration = 2,
+            Image   = 4483362458,
+        })
+
+        if progress >= 100 then
+            Rayfield:Notify({
+                Title   = "Analyzer Selesai",
+                Content = roomName .. " sudah 100%, lanjut ke Monitor",
+                Duration = 3,
+                Image   = 4483362458,
+            })
+            return
+        end
+
+        task.wait(2)
+    end
+end
+
+-- Fungsi 1: DetectSleepingNPC
+local function DetectSleepingNPC()
+    DetectedNPC = {}
+
+    local npcFolder     = workspace:FindFirstChild("NPCs")
+    local medicalFolder = getFolder(workspace, "Rooms", "Medical")
+
+    if not npcFolder then
+        Rayfield:Notify({ Title="Error", Content="Folder NPCs tidak ditemukan di Workspace", Duration=4, Image=4483362458 })
+        return
+    end
+
+    if not medicalFolder then
+        Rayfield:Notify({ Title="Error", Content="Folder Rooms > Medical tidak ditemukan", Duration=4, Image=4483362458 })
+        return
+    end
+
+    -- Kumpulkan Union dari setiap Room > Minigame > Bed > Union
+    local bedUnions = {}
+    for _, room in ipairs(medicalFolder:GetChildren()) do
+        if room:IsA("Model") or room:IsA("Folder") then
+            local union = getFolder(room, "Minigame", "Bed", "Union")
+            if union and union:IsA("BasePart") then
+                table.insert(bedUnions, {
+                    RoomName = room.Name,
+                    RoomObj  = room,
+                    Union    = union,
+                })
+            else
+                warn("[FaLtix] Room " .. room.Name .. " tidak punya Minigame > Bed > Union")
+            end
+        end
+    end
+
+    if #bedUnions == 0 then
+        Rayfield:Notify({ Title="Warning", Content="Tidak ada Union ditemukan di Room > Minigame > Bed", Duration=4, Image=4483362458 })
+        return
+    end
+
+    -- Scan jarak NPC ke tiap Union
+    for _, npc in ipairs(npcFolder:GetChildren()) do
+        if not npc:IsA("Model") then continue end
+        local npcHRP = npc:FindFirstChild("HumanoidRootPart")
+        if not npcHRP then continue end
+
+        for _, bedData in ipairs(bedUnions) do
+            local dist = (npcHRP.Position - bedData.Union.Position).Magnitude
+            if dist <= SLEEP_DISTANCE then
+                table.insert(DetectedNPC, {
+                    NPC     = npc,
+                    Room    = bedData.RoomName,
+                    RoomObj = bedData.RoomObj,
+                    Dist    = math.floor(dist * 100) / 100,
+                })
+                break
+            end
+        end
+    end
+
+    local count = #DetectedNPC
+    if count > 0 then
+        local lines = ""
+        for _, d in ipairs(DetectedNPC) do
+            lines = lines .. d.NPC.Name .. " di " .. d.Room .. " (" .. d.Dist .. " studs)\n"
+        end
+        Rayfield:Notify({ Title=count .. " NPC Tidur Ditemukan", Content=lines, Duration=7, Image=4483362458 })
+    else
+        Rayfield:Notify({ Title="Scan Selesai", Content="Tidak ada NPC yang tidur", Duration=4, Image=4483362458 })
+    end
+end
+
+-- Fungsi 2: AutoTreatNPC
+-- Flow per NPC:
+-- 0. Teleport ke NPC > Fire PP
+-- 1. Teleport ke Analyzer > Fire PP > tunggu 100%
+-- 2. Teleport ke Monitor > Fire PP lalu PP2
+-- 3. Loop scan inv sampai obat muncul
+--    Path: Minigame > TV > Screen > UI > Report > inv
+-- 4. Ambil semua obat dulu, baru balik ke NPC
+-- 5. Teleport ke InBed > Fire PP
+local function AutoTreatNPC()
+    if #DetectedNPC == 0 then
+        Rayfield:Notify({ Title="Belum Ada Data", Content="Jalankan Detect dulu!", Duration=4, Image=4483362458 })
+        return
+    end
+
+    local doneCount = 0
+
+    for idx, data in ipairs(DetectedNPC) do
+        local npc      = data.NPC
+        local roomObj  = data.RoomObj
+        local roomName = data.Room
+
+        -- Validasi NPC masih ada
+        if not npc or not npc.Parent then
+            warn("[FaLtix] NPC hilang, skip")
+            Rayfield:Notify({ Title="NPC Hilang", Content="NPC sudah tidak ada, skip ke berikutnya", Duration=3, Image=4483362458 })
+            continue
+        end
+
+        local npcHRP = npc:FindFirstChild("HumanoidRootPart")
+        if not npcHRP then
+            warn("[FaLtix] HRP tidak ada, skip")
+            Rayfield:Notify({ Title="HRP Tidak Ada", Content="HumanoidRootPart NPC tidak ditemukan", Duration=3, Image=4483362458 })
+            continue
+        end
+
+        local minigame = roomObj:FindFirstChild("Minigame")
+        if not minigame then
+            warn("[FaLtix] Minigame tidak ada di " .. roomName)
+            Rayfield:Notify({ Title="Minigame Tidak Ada", Content="Folder Minigame tidak ada di " .. roomName, Duration=3, Image=4483362458 })
+            continue
+        end
+
+        Rayfield:Notify({
+            Title   = "NPC " .. idx .. " dari " .. #DetectedNPC,
+            Content = npc.Name .. " di " .. roomName,
+            Duration = 3,
+            Image   = 4483362458,
+        })
+
+        -- STEP 0: Teleport ke NPC > Fire PP
+        warn("[FaLtix] STEP 0: Ke NPC di " .. roomName)
+        local ok0 = teleportTo(npcHRP.CFrame)
+        if not ok0 then
+            Rayfield:Notify({ Title="Teleport Gagal", Content="Gagal teleport ke NPC di " .. roomName, Duration=3, Image=4483362458 })
+            continue
+        end
+        task.wait(STEP_DELAY)
+        firePP(npc, "NPC di " .. roomName)
+        task.wait(STEP_DELAY)
+
+        -- STEP 1: Analyzer > Fire PP > tunggu 100%
+        warn("[FaLtix] STEP 1: Analyzer di " .. roomName)
+        local analyzer = minigame:FindFirstChild("Analyzer")
+        if not analyzer then
+            warn("[FaLtix] Analyzer tidak ada di " .. roomName)
+            Rayfield:Notify({ Title="Analyzer Tidak Ada", Content="Folder Analyzer tidak ada di " .. roomName, Duration=3, Image=4483362458 })
+        else
+            local cfAnalyzer = getCFrame(analyzer)
+            if not cfAnalyzer then
+                warn("[FaLtix] Analyzer tidak punya BasePart di " .. roomName)
+                Rayfield:Notify({ Title="Analyzer Tanpa Part", Content="Analyzer tidak punya BasePart di " .. roomName, Duration=3, Image=4483362458 })
+            else
+                teleportTo(cfAnalyzer)
+                task.wait(STEP_DELAY)
+                firePP(analyzer, "Analyzer di " .. roomName)
+                task.wait(STEP_DELAY)
+                waitAnalyzer100(analyzer, roomName)
+            end
+        end
+
+        -- STEP 2: Monitor > Fire PP lalu PP2
+        warn("[FaLtix] STEP 2: Monitor di " .. roomName)
+        local monitor = minigame:FindFirstChild("Monitor")
+        if not monitor then
+            warn("[FaLtix] Monitor tidak ada di " .. roomName)
+            Rayfield:Notify({ Title="Monitor Tidak Ada", Content="Folder Monitor tidak ada di " .. roomName, Duration=3, Image=4483362458 })
+        else
+            local cfMonitor = getCFrame(monitor)
+            if not cfMonitor then
+                warn("[FaLtix] Monitor tidak punya BasePart di " .. roomName)
+                Rayfield:Notify({ Title="Monitor Tanpa Part", Content="Monitor tidak punya BasePart di " .. roomName, Duration=3, Image=4483362458 })
+            else
+                teleportTo(cfMonitor)
+                task.wait(STEP_DELAY)
+                firePP(monitor, "Monitor di " .. roomName)
+                task.wait(STEP_DELAY)
+                firePP2(monitor, "Monitor di " .. roomName)
+                task.wait(STEP_DELAY)
+            end
+        end
+
+        -- STEP 3: Loop scan inv sampai obat muncul
+        -- Path: Minigame > TV > Screen > UI > Report > inv
+        warn("[FaLtix] STEP 3: Scan inv di " .. roomName)
+
+        local tv = minigame:FindFirstChild("TV")
+        if not tv then
+            warn("[FaLtix] TV tidak ada di " .. roomName)
+            Rayfield:Notify({ Title="TV Tidak Ada", Content="Folder TV tidak ada di Minigame " .. roomName, Duration=4, Image=4483362458 })
+        end
+
+        local neededItems = {}
+
+        while #neededItems == 0 do
+            task.wait(2)
+
+            local inv = getFolder(minigame, "TV", "Screen", "UI", "Report", "inv")
+
+            if not inv then
+                warn("[FaLtix] inv belum ada di " .. roomName)
+                Rayfield:Notify({
+                    Title   = "Menunggu inv",
+                    Content = "inv belum muncul di " .. roomName .. ", scan ulang...",
+                    Duration = 2,
+                    Image   = 4483362458,
+                })
+            else
+                -- Scan isi inv, ambil yang namanya obat
+                for _, child in ipairs(inv:GetChildren()) do
+                    if ITEM_SET[child.Name] then
+                        table.insert(neededItems, child.Name)
+                        warn("[FaLtix] Obat ditemukan di inv: " .. child.Name)
+                    end
+                end
+
+                if #neededItems == 0 then
+                    warn("[FaLtix] inv ada tapi obat belum muncul di " .. roomName)
+                    Rayfield:Notify({
+                        Title   = "inv Kosong",
+                        Content = "inv ada tapi obat belum muncul di " .. roomName,
+                        Duration = 2,
+                        Image   = 4483362458,
+                    })
+                end
+            end
+        end
+
+        -- Notif daftar obat yang perlu diambil
+        local obatList = ""
+        for _, nama in ipairs(neededItems) do
+            obatList = obatList .. "- " .. nama .. "\n"
+        end
+        Rayfield:Notify({
+            Title   = "Obat Dibutuhkan",
+            Content = obatList,
+            Duration = 5,
+            Image   = 4483362458,
+        })
+        task.wait(1)
+
+        -- STEP 4: Ambil semua obat dulu, baru balik ke NPC
+        warn("[FaLtix] STEP 4: Ambil " .. #neededItems .. " obat")
+
+        for _, itemName in ipairs(neededItems) do
+
+            Rayfield:Notify({
+                Title   = "Menuju Item",
+                Content = "Ambil: " .. itemName,
+                Duration = 2,
+                Image   = 4483362458,
+            })
+            task.wait(0.3)
+
+            -- Cari Items folder
+            local itemsFolder = findItemsFolder()
+            if not itemsFolder then
+                continue
+            end
+
+            -- Cari folder obat di dalam Items
+            local itemFolder = itemsFolder:FindFirstChild(itemName)
+            if not itemFolder then
+                warn("[FaLtix] Item tidak ada: " .. itemName)
+                Rayfield:Notify({
+                    Title   = "Item Tidak Ada",
+                    Content = itemName .. " tidak ditemukan di dalam Items",
+                    Duration = 3,
+                    Image   = 4483362458,
+                })
+                continue
+            end
+
+            warn("[FaLtix] Item ditemukan: " .. itemFolder:GetFullName() .. " | Class: " .. itemFolder.ClassName)
+
+            -- Cari CFrame dari folder obat
+            local cf = getCFrame(itemFolder)
+            if not cf then
+                -- Log isi folder buat debug
+                local isiFolder = ""
+                for _, c in ipairs(itemFolder:GetChildren()) do
+                    isiFolder = isiFolder .. c.Name .. " (" .. c.ClassName .. ") "
+                end
+                warn("[FaLtix] getCFrame nil untuk " .. itemName .. " | Isi: " .. isiFolder)
+                Rayfield:Notify({
+                    Title   = "Posisi Tidak Ditemukan",
+                    Content = itemName .. " tidak punya BasePart\nIsi: " .. isiFolder,
+                    Duration = 5,
+                    Image   = 4483362458,
+                })
+                continue
+            end
+
+            -- Teleport ke item
+            warn("[FaLtix] Teleport ke: " .. itemName)
+            local okTp = teleportTo(cf)
+            if not okTp then
+                Rayfield:Notify({
+                    Title   = "Teleport Gagal",
+                    Content = "Gagal teleport ke " .. itemName,
+                    Duration = 3,
+                    Image   = 4483362458,
+                })
+                continue
+            end
+            task.wait(STEP_DELAY)
+
+            -- Fire PP ambil obat
+            firePP(itemFolder, "Item " .. itemName)
+            task.wait(STEP_DELAY)
+
+            Rayfield:Notify({
+                Title   = "Berhasil Diambil",
+                Content = itemName .. " sudah diambil, lanjut obat berikutnya",
+                Duration = 2,
+                Image   = 4483362458,
+            })
+        end
+
+        -- Setelah semua obat diambil, baru teleport ke NPC
+        warn("[FaLtix] Semua obat diambil, balik ke NPC")
+        Rayfield:Notify({
+            Title   = "Semua Obat Diambil",
+            Content = "Kembali ke NPC " .. npc.Name,
+            Duration = 3,
+            Image   = 4483362458,
+        })
+        teleportTo(npcHRP.CFrame)
+        task.wait(STEP_DELAY)
+
+        -- STEP 5: InBed > Fire PP
+        -- Path: Minigame > Bed > InBed
+        warn("[FaLtix] STEP 5: InBed di " .. roomName)
+        local inBed = getFolder(minigame, "Bed", "InBed")
+        if not inBed then
+            warn("[FaLtix] InBed tidak ada di " .. roomName)
+            Rayfield:Notify({ Title="InBed Tidak Ada", Content="Folder InBed tidak ada di Minigame > Bed di " .. roomName, Duration=3, Image=4483362458 })
+        else
+            local cfInBed = getCFrame(inBed)
+            if not cfInBed then
+                warn("[FaLtix] InBed tidak punya BasePart di " .. roomName)
+                Rayfield:Notify({ Title="InBed Tanpa Part", Content="InBed tidak punya BasePart di " .. roomName, Duration=3, Image=4483362458 })
+            else
+                teleportTo(cfInBed)
+                task.wait(STEP_DELAY)
+                firePP(inBed, "InBed di " .. roomName)
+                task.wait(STEP_DELAY)
+            end
+        end
+
+        doneCount = doneCount + 1
+        warn("[FaLtix] NPC " .. idx .. " selesai!")
+    end
+
+    Rayfield:Notify({
+        Title   = "Selesai",
+        Content = "Treated " .. doneCount .. " dari " .. #DetectedNPC .. " NPC",
+        Duration = 5,
+        Image   = 4483362458,
+    })
+end
+
+-- Window Rayfield
+local Window = Rayfield:CreateWindow({
+    Name            = "FaLtix HuBx",
+    Icon            = 0,
+    LoadingTitle    = "FaLtix HuBx",
+    LoadingSubtitle = "Auto Treat",
+    Theme           = "Dark",
+    ConfigurationSaving = { Enabled = false },
+    Discord   = { Enabled = false },
+    KeySystem = false,
+})
+
+-- Tab Main
+local MainTab = Window:CreateTab("Main", 4483362458)
+
+MainTab:CreateSection("Step 1 - Scan NPC")
+MainTab:CreateLabel("Scan NPC tidur di Bed, jarak kurang dari " .. SLEEP_DISTANCE .. " studs")
+MainTab:CreateDivider()
+
+MainTab:CreateButton({
+    Name     = "Detect Sleeping NPC",
+    Callback = function()
+        Rayfield:Notify({ Title="Scanning", Content="Sedang scan semua Room...", Duration=2, Image=4483362458 })
+        task.wait(0.1)
+        DetectSleepingNPC()
+    end,
+})
+
+MainTab:CreateDivider()
+MainTab:CreateSection("Step 2 - Auto Treat")
+MainTab:CreateLabel("Flow: NPC > Analyzer > Monitor > Obat > InBed")
+MainTab:CreateDivider()
+
+MainTab:CreateButton({
+    Name     = "Auto Treat Sleeping NPC",
+    Callback = function()
+        coroutine.wrap(function()
+            AutoTreatNPC()
+        end)()
+    end,
+})
+
+-- Notif welcome
+Rayfield:Notify({
+    Title   = "FaLtix HuBx",
+    Content = "Detect dulu, lalu Treat!",
+    Duration = 4,
+    Image   = 4483362458,
+})
